@@ -6,7 +6,7 @@
 #include "../../communication/can/comm_can.h"
 #include "../../communication/nvm/comm_nvm.h"
 #include "../../datalayer/datalayer.h"
-#include "../wifi/wifi.h"
+#include "../network/hostname.h"  // default_hostname()
 #include "html_escape.h"
 #include "index_html.h"
 #include "src/battery/BATTERIES.h"
@@ -276,9 +276,8 @@ String settings_processor(const String& var, BatteryEmulatorSettingsStore& setti
            capability_css("if-tricapable", battery_supports_triple);
   }
   if (var == "BATTCHEM") {
-    return options_for_enum(
-        (battery_chemistry_enum)settings.getUInt("BATTCHEM", (int)battery_chemistry_enum::Autodetect),
-        name_for_chemistry);
+    return options_for_enum((battery_chemistry_enum)settings.getUInt("BATTCHEM", (int)battery_chemistry_enum::NCA),
+                            name_for_chemistry);
   }
   if (var == "INVTYPE") {
     return options_for_enum_with_none(
@@ -310,8 +309,8 @@ String settings_processor(const String& var, BatteryEmulatorSettingsStore& setti
 
   if (var == "CTATTEN") {
     return options_for_enum_with_none(
-        (adc_attenuation_enum)settings.getUInt("CTATTEN", (int)adc_attenuation_enum::ADC_0db), name_for_adc_attenuation,
-        adc_attenuation_enum::ADC_0db);
+        (adc_attenuation_enum)settings.getUInt("CTATTEN", (int)adc_attenuation_enum::ADC_11db),
+        name_for_adc_attenuation, adc_attenuation_enum::ADC_0db);
   }
 
   if (var == "EQSTOP") {
@@ -360,7 +359,7 @@ String settings_processor(const String& var, BatteryEmulatorSettingsStore& setti
   }
 
   if (var == "SUNGROW_MODEL") {
-    return options_from_map(settings.getUInt("INVSUNTYPE", 1), sungrow_models);  // Default: SBR096
+    return options_from_map(settings.getUInt("INVSUNTYPE", 0), sungrow_models);  // Default: SBR064, as boot assumes
   }
 
   if (var == "PYLON_MODEL") {
@@ -517,6 +516,10 @@ String raw_settings_processor(const String& var, BatteryEmulatorSettingsStore& s
     return settings.getBool("SOCESTIMATED") ? "checked" : "";
   }
 
+  if (var == "CHGESTIMATED") {
+    return settings.getBool("CHGESTIMATED") ? "checked" : "";
+  }
+
   if (var == "CNTCTRL") {
     return settings.getBool("CNTCTRL") ? "checked" : "";
   }
@@ -526,6 +529,9 @@ String raw_settings_processor(const String& var, BatteryEmulatorSettingsStore& s
   }
 
   if (var == "CHGTAPERSOC") {
+    if (settings.getBool("CHGESTIMATED")) {
+      return "checked";
+    }
     if (battery && battery->mandatory_charge_taper()) {
       return "checked";
     }
@@ -634,11 +640,11 @@ String raw_settings_processor(const String& var, BatteryEmulatorSettingsStore& s
   }
 
   if (var == "CHGPOWER") {
-    return String(settings.getUInt("CHGPOWER", 0));
+    return String(settings.getUInt("CHGPOWER", 1000));
   }
 
   if (var == "DCHGPOWER") {
-    return String(settings.getUInt("DCHGPOWER", 0));
+    return String(settings.getUInt("DCHGPOWER", 1000));
   }
 
   if (var == "LOCALIP") {
@@ -723,6 +729,10 @@ String raw_settings_processor(const String& var, BatteryEmulatorSettingsStore& s
     return settings.getBool("ESPNOWENABLED") ? "checked" : "";
   }
 
+  if (var == "ESPNOWMACS") {
+    return settings.getString("ESPNOWMACS");
+  }
+
   if (var == "MQTTENABLED") {
     return settings.getBool("MQTTENABLED") ? "checked" : "";
   }
@@ -755,8 +765,21 @@ String raw_settings_processor(const String& var, BatteryEmulatorSettingsStore& s
     return settings.getBool("MQTTCELLV") ? "checked" : "";
   }
 
+  if (var == "MQTTHEAP") {
+    return settings.getBool("MQTTHEAP") ? "checked" : "";
+  }
+
   if (var == "HADISC") {
     return settings.getBool("HADISC") ? "checked" : "";
+  }
+
+  if (var == "HADISCFWU") {
+    return settings.getBool("HADISCFWU") ? "checked" : "";
+  }
+
+  // Not a stored setting: the master switch is on whenever one of the options below it is.
+  if (var == "HADISCEN") {
+    return (settings.getBool("HADISC") || settings.getBool("HADISCFWU")) ? "checked" : "";
   }
 
   if (var == "HADISCTOPIC") {
@@ -1298,6 +1321,11 @@ const char* getCANInterfaceName(CAN_Interface interface) {
 
           function goToMainPage() { window.location.href = '/'; }
 
+          function haDisc(c) {
+            var f = document.querySelector("[name=HADISCFWU]"), n = document.querySelector("[name=HADISC]");
+            if (!c.checked) { f.checked = n.checked = false; } else if (!f.checked && !n.checked) { f.checked = true; }
+          }
+
           document.querySelectorAll('select,input').forEach(function(sel) {
             function ch() {
               sel.closest('form').setAttribute('data-' + sel.name?.toLowerCase(), sel.type=='checkbox'?sel.checked:sel.value);
@@ -1404,12 +1432,21 @@ const char* getCANInterfaceName(CAN_Interface interface) {
     form[data-battery="14"] .if-estimated, 
     form[data-battery="16"] .if-estimated, 
     form[data-battery="24"] .if-estimated,
+    form[data-battery="26"] .if-estimated,
     form[data-battery="32"] .if-estimated, 
     form[data-battery="33"] .if-estimated,
     form[data-battery="40"] .if-estimated,
     form[data-battery="41"] .if-estimated,
+    form[data-battery="44"] .if-estimated,
     form[data-battery="50"] .if-estimated,
     form[data-battery="51"] .if-estimated {
+      display: contents;
+    }
+
+    form .if-chgestimated { display: none; } /* Integrations where you sometimes want to fallback to user set charge/discharge power options, since they are for unknown reason not available on some packs */
+    form[data-battery="8"] .if-chgestimated,
+    form[data-battery="26"] .if-chgestimated,
+    form[data-battery="44"] .if-chgestimated {
       display: contents;
     }
 
@@ -1533,8 +1570,18 @@ const char* getCANInterfaceName(CAN_Interface interface) {
       display: contents;
     }
 
+    form .if-hadiscen { display: none; }
+    form[data-hadiscen="true"] .if-hadiscen {
+      display: contents;
+    }
+
     form .if-syslogen { display: none; }
     form[data-syslogen="true"] .if-syslogen {
+      display: contents;
+    }
+
+    form .if-espnowenabled { display: none; }
+    form[data-espnowenabled="true"] .if-espnowenabled {
       display: contents;
     }
 
@@ -1750,6 +1797,12 @@ const char* getCANInterfaceName(CAN_Interface interface) {
         <label>Use estimated SOC: </label>
         <input type='checkbox' name='SOCESTIMATED' value='on' %SOCESTIMATED% 
         title="Switch to estimated State of Charge when accurate SOC data is not available from the battery" />
+        </div>
+
+        <div class="if-chgestimated">
+        <label>Use estimated charge limits: </label>
+        <input type='checkbox' name='CHGESTIMATED' value='on' %CHGESTIMATED% 
+        title="Switch to estimated charge/discharge limits when accurate data is not available from the battery" />
         </div>
 
         <div class="if-battery">
@@ -2101,7 +2154,15 @@ const char* getCANInterfaceName(CAN_Interface interface) {
         <div style='display: grid; grid-template-columns: 1fr 1.5fr; gap: 10px; align-items: center;'>
 
         <label>Enable ESPNow: </label>
-        <input type='checkbox' name='ESPNOWENABLED' value='on' %ESPNOWENABLED% />
+        <input type='checkbox' name='ESPNOWENABLED' value='on' %ESPNOWENABLED%
+        title="Send battery telemetry to nearby devices over ESP-NOW" />
+
+        <div class='if-espnowenabled'>
+        <label>ESPNow receiver MACs: </label>
+        <input type='text' name='ESPNOWMACS' value="%ESPNOWMACS%" maxlength="180"
+        pattern="\s*[0-9A-Fa-f]{2}([:\-]?[0-9A-Fa-f]{2}){5}(\s*[,;]\s*[0-9A-Fa-f]{2}([:\-]?[0-9A-Fa-f]{2}){5})*\s*"
+        title="Comma separated list of receiver MAC addresses, e.g. AA:BB:CC:DD:EE:FF, 11:22:33:44:55:66 (max 8). Leave empty to broadcast to every device. Takes effect after a restart." />
+        </div>
 
         <label>Enable MQTT: </label>
         <input type='checkbox' name='MQTTENABLED' value='on' %MQTTENABLED% />
@@ -2130,14 +2191,27 @@ const char* getCANInterfaceName(CAN_Interface interface) {
         min="1" max="300" step="1"
         title="How often to publish MQTT messages in seconds (1-300, step 1). Default: 5" />
         <label>Send all cellvoltages via MQTT: </label><input type='checkbox' name='MQTTCELLV' value='on' %MQTTCELLV% />
+        <label>Publish heap metric diagnostics: </label>
+        <input type='checkbox' name='MQTTHEAP' value='on' %MQTTHEAP%
+        title="Publish free heap, largest free block, minimum free heap and heap fragmentation to the /info topic and to Home Assistant autodiscovery. Takes effect after a restart." />
         <label>Allow remote BMS reset via MQTT: </label>
         <input type='checkbox' name='REMBMSRESET' value='on' %REMBMSRESET% />
-        <label>Enable Home Assistant auto discovery: </label>
-        <input type='checkbox' name='HADISC' value='on' %HADISC% />
-        <label>Home Assistant auto discovery topic: </label>
+        <label>Home Assistant autodiscovery: </label>
+        <input type='checkbox' name='HADISCEN' value='on' %HADISCEN% onchange='haDisc(this)'
+        title="Publish Home Assistant MQTT discovery configs. The broker retains them, so Home Assistant keeps the entities without them being republished at every boot." />
+
+        <div class='if-hadiscen'>
+        <label>Autodiscovery topic: </label>
         <input type='text' name='HADISCTOPIC' value="%HADISCTOPIC%"
         pattern="[A-Za-z0-9_\-]+"
         title="MQTT auto discovery base topic (letters, numbers, '_', '-')" />
+        <label>Publish at firmware updates: </label>
+        <input type='checkbox' name='HADISCFWU' value='on' %HADISCFWU%
+        title="Publish the discovery configs once after every firmware update. They carry the software version and can gain or change entities between releases." />
+        <label>Publish at next boot: </label>
+        <input type='checkbox' name='HADISC' value='on' %HADISC%
+        title="Publish the discovery configs once after the next restart. Clears itself once they have been published." />
+        </div>
 
         </div>
 

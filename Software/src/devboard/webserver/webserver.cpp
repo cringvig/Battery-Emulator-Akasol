@@ -1,6 +1,5 @@
 #include "webserver.h"
 #include <Preferences.h>
-#include <ctime>
 #include <vector>
 #include "../../battery/BATTERIES.h"
 #include "../../battery/Battery.h"
@@ -15,13 +14,20 @@
 #include "../../devboard/safety/safety.h"
 #include "../../inverter/INVERTERS.h"
 #include "../../lib/bblanchon-ArduinoJson/ArduinoJson.h"
+#include "../network/hostname.h"
+#include "../network/network_status.h"
 #include "../sdcard/sdcard.h"
 #include "../utils/events.h"
 #include "../utils/led_handler.h"
+#include "../utils/millis64.h"
+#include "../utils/time_format.h"
 #include "../utils/timer.h"
+#include "../utils/version.h"
+#include "../wifi/wifi.h"
 #include "esp_task_wdt.h"
 #include "favicon.h"
 #include "html_escape.h"
+#include "webserver_can_streaming.h"
 
 #include <string>
 
@@ -29,14 +35,13 @@ std::string http_username;
 std::string http_password;
 
 bool webserver_auth = false;
-static constexpr const char* WEB_AUTH_REALM = "Battery Emulator";
 
 // Create AsyncWebServer object on port 80
 AsyncWebServer server(80);
 AsyncAuthenticationMiddleware web_auth_middleware;
 
 // Measure OTA progress
-unsigned long ota_progress_millis = 0;
+static MyTimer ota_progress_timer = MyTimer(1000);
 
 #include "advanced_battery_html.h"
 #include "can_logging_html.h"
@@ -348,23 +353,11 @@ void init_webserver() {
         logs = "No logs available.";
       }
 
-      // Get the current time
-      time_t now = time(nullptr);
-      struct tm timeinfo;
-      localtime_r(&now, &timeinfo);
-
-      // Ensure time retrieval was successful
-      char filename[32];
-      if (strftime(filename, sizeof(filename), "canlog_%H-%M-%S.txt", &timeinfo)) {
-        // Valid filename created
-      } else {
-        // Fallback filename if automatic timestamping failed
-        strcpy(filename, "battery_emulator_can_log.txt");
-      }
+      String filename = "canlog_" + format_ms_stamp(millis64()) + ".txt";
 
       // Use request->send with dynamic headers
       AsyncWebServerResponse* response = request->beginResponse(200, "text/plain", logs);
-      response->addHeader("Content-Disposition", String("attachment; filename=\"") + String(filename) + "\"");
+      response->addHeader("Content-Disposition", "attachment; filename=\"" + filename + "\"");
       request->send(response);
     });
   }
@@ -393,23 +386,11 @@ void init_webserver() {
         logs = "No logs available.";
       }
 
-      // Get the current time
-      time_t now = time(nullptr);
-      struct tm timeinfo;
-      localtime_r(&now, &timeinfo);
-
-      // Ensure time retrieval was successful
-      char filename[32];
-      if (strftime(filename, sizeof(filename), "log_%H-%M-%S.txt", &timeinfo)) {
-        // Valid filename created
-      } else {
-        // Fallback filename if automatic timestamping failed
-        strcpy(filename, "battery_emulator_log.txt");
-      }
+      String filename = "log_" + format_ms_stamp(millis64()) + ".txt";
 
       // Use request->send with dynamic headers
       AsyncWebServerResponse* response = request->beginResponse(200, "text/plain", logs);
-      response->addHeader("Content-Disposition", String("attachment; filename=\"") + String(filename) + "\"");
+      response->addHeader("Content-Disposition", "attachment; filename=\"" + filename + "\"");
       request->send(response);
     });
   }
@@ -439,6 +420,7 @@ void init_webserver() {
     BatteryEmulatorSettingsStore settings;
     settings.clearAll();
     erase_phy_cal_data();
+    LOG_SET_NEXT_SEVERITY(5);  // notice
     logging.println("Factory reset performed from the web interface.");
     request->send(200, "text/html", "OK");
   });
@@ -449,7 +431,7 @@ void init_webserver() {
       "HADISC",       "MQTTCELLV",    "GTWRHD",        "DIGITALHVIL", "PERFPROFILE",   "INTERLOCKREQ", "SOCESTIMATED",
       "PYLONOFFSET",  "PYLONORDER",   "DEYEBYD",       "NCCONTACTOR", "TRIBTR",        "CNTCTRLTRI",   "ESPNOWENABLED",
       "PRIMOGEN24",   "CTINVERT",     "LOWPASSFILTER", "WEBAUTH",     "SLOWCANINV",    "CHGTAPERSOC",  "MEASURECPUTEMP",
-      "SYSLOGEN",     "PERBMSDEFSOC", "PERBMSSKIPBAL", "INVOFFGRID",
+      "SYSLOGEN",     "PERBMSDEFSOC", "PERBMSSKIPBAL", "INVOFFGRID",  "CHGESTIMATED",  "MQTTHEAP",     "HADISCFWU",
 #ifdef SDCARD
       "SDLOGENABLED", "CANLOGSD",
 #endif  // SDCARD
@@ -466,9 +448,9 @@ void init_webserver() {
       "SYSLOGFAC",  "PERBMSRESETH",
   };
 
-  const char* stringSettingNames[] = {"APPASSWORD", "HOSTNAME",    "MQTTSERVER", "MQTTUSER", "MQTTPASSWORD",
-                                      "HTTPUSER",   "HTTPPASS",    "LOCALIP",    "GATEWAY",  "SUBNET",
-                                      "DNS",        "HADISCTOPIC", "SYSLOGIP"};
+  const char* stringSettingNames[] = {"APPASSWORD", "HOSTNAME",    "MQTTSERVER", "MQTTUSER",  "MQTTPASSWORD",
+                                      "HTTPUSER",   "HTTPPASS",    "LOCALIP",    "GATEWAY",   "SUBNET",
+                                      "DNS",        "HADISCTOPIC", "SYSLOGIP",   "ESPNOWMACS"};
 
   // Handles the form POST from UI to save settings of the common image
   server.on("/saveSettings", HTTP_POST,
@@ -719,6 +701,30 @@ void init_webserver() {
     datalayer_extended.bydAtto3.calibrationTargetAH = static_cast<uint16_t>(value.toFloat());
   });
 
+  // Isolation monitor control (RoutineControl 0x2008). One setting, applied to both batteries.
+  def_route_with_auth("/bydAtto3IsoDisable", server, HTTP_GET, [](AsyncWebServerRequest* request) {
+    datalayer_extended.bydAtto3.UserRequestIsoRoutineDisable = true;
+    datalayer_extended.bydAtto3_2.UserRequestIsoRoutineDisable = true;
+    request->send(200, "text/plain", "OK");
+  });
+  def_route_with_auth("/bydAtto3IsoEnable", server, HTTP_GET, [](AsyncWebServerRequest* request) {
+    datalayer_extended.bydAtto3.UserRequestIsoRoutineEnable = true;
+    datalayer_extended.bydAtto3_2.UserRequestIsoRoutineEnable = true;
+    request->send(200, "text/plain", "OK");
+  });
+  def_route_with_auth("/bydAtto3KeepIsoDisabled", server, HTTP_GET, [](AsyncWebServerRequest* request) {
+    if (request->hasParam("value")) {
+      bool enabled = request->getParam("value")->value().toInt() != 0;
+      datalayer_extended.bydAtto3.keep_iso_disabled = enabled;
+      datalayer_extended.bydAtto3_2.keep_iso_disabled = enabled;
+      Preferences prefs;
+      prefs.begin("batterySettings", false);
+      prefs.putBool("BYDKEEPISOOFF", enabled);
+      prefs.end();
+    }
+    request->send(200, "text/plain", "OK");
+  });
+
   // Battery 2 auto-calibration routes
   update_string_setting("/editCalTargetSOC2", [](String value) {
     datalayer_extended.bydAtto3_2.calibrationTargetSOC = static_cast<uint16_t>(value.toFloat());
@@ -796,6 +802,8 @@ void init_webserver() {
           }
           request->send(200, "text/plain", "Command performed.");
         });
+
+    register_dump_can_route(server);
   }
 
   // Route for editing BATTERY_USE_VOLTAGE_LIMITS
@@ -897,30 +905,9 @@ void init_webserver() {
   server.begin();
 }
 
-String getConnectResultString(wl_status_t status) {
-  switch (status) {
-    case WL_CONNECTED:
-      return "Connected";
-    case WL_NO_SHIELD:
-      return "No shield";
-    case WL_IDLE_STATUS:
-      return "Idle status";
-    case WL_NO_SSID_AVAIL:
-      return "No SSID available";
-    case WL_SCAN_COMPLETED:
-      return "Scan completed";
-    case WL_CONNECT_FAILED:
-      return "Connect failed";
-    case WL_CONNECTION_LOST:
-      return "Connection lost";
-    case WL_DISCONNECTED:
-      return "Disconnected";
-    default:
-      return "Unknown";
-  }
-}
+void webserver_tick() {
+  can_dump_drain_tick();
 
-void ota_monitor() {
   if (ota_active && ota_timeout_timer.elapsed()) {
     // OTA timeout, try to restore can and clear the update event
     set_event(EVENT_OTA_UPDATE_TIMEOUT, 0);
@@ -948,27 +935,6 @@ String get_firmware_info_processor(const String& var) {
     return content;
   }
   return String();
-}
-
-String get_uptime() {
-  uint64_t milliseconds;
-  uint32_t remaining_seconds_in_day;
-  uint32_t remaining_seconds;
-  uint32_t remaining_minutes;
-  uint32_t remaining_hours;
-  uint16_t total_days;
-
-  milliseconds = millis64();
-
-  //convert passed millis to days, hours, minutes, seconds
-  total_days = milliseconds / (1000 * 60 * 60 * 24);
-  remaining_seconds_in_day = (milliseconds / 1000) % (60 * 60 * 24);
-  remaining_hours = remaining_seconds_in_day / (60 * 60);
-  remaining_minutes = (remaining_seconds_in_day % (60 * 60)) / 60;
-  remaining_seconds = remaining_seconds_in_day % 60;
-
-  return (String)total_days + " days, " + (String)remaining_hours + " hours, " + (String)remaining_minutes +
-         " minutes, " + (String)remaining_seconds + " seconds";
 }
 
 String processor(const String& var) {
@@ -1005,12 +971,25 @@ String processor(const String& var) {
     content += "</style>";
 
     // Compact header
-    content += "<h2>Battery Emulator</h2>";
+    content +=
+        "<h2><a href='https://dalathegreat.github.io/Battery-Emulator-Wiki/' target='_blank' "
+        "rel='noopener' style='color:inherit'>Battery Emulator</a></h2>";
 
     // Start content block
     content += "<div style='background-color: #303E47; padding: 10px; margin-bottom: 10px; border-radius: 50px'>";
     content += "<div id='bxUpd' style='text-align:center'></div>";
-    content += "<h4>Software: " + String(version_number);
+    content += "<h4>Software: ";
+#if defined(GIT_TAG) && defined(GITHUB_ORG) && defined(GITHUB_REPO)
+    content += "<a href='https://github.com/" GITHUB_ORG "/" GITHUB_REPO "/releases/tag/" GIT_TAG
+               "' target='_blank' style='color:#fff'>" +
+               String(version_number) + "</a>";
+#elif defined(GITHUB_PR) && defined(GITHUB_ORG) && defined(GITHUB_REPO)
+    content += "<a href='https://github.com/" GITHUB_ORG "/" GITHUB_REPO "/pull/" GITHUB_PR
+               "' target='_blank' style='color:#fff'>" +
+               String(version_number) + "</a>";
+#else
+    content += String(version_number);
+#endif
 
 // Show hardware used:
 #ifdef HW_LILYGO
@@ -1033,7 +1012,7 @@ String processor(const String& var) {
     } else {
       content += "</h4>";
     }
-    content += "<h4>Uptime: " + get_uptime() + "</h4>";
+    content += "<h4>Uptime: " + format_ms_string(millis64()) + "</h4>";
     if (datalayer.system.info.performance_measurement_active) {
       content +=
           "<h4>Free heap: " + String(ESP.getFreeHeap()) + ", max alloc: " + String(ESP.getMaxAllocHeap()) + "</h4>";
@@ -1062,19 +1041,26 @@ String processor(const String& var) {
       content += "<h4>CAN TX function timing: " + String(datalayer.system.status.time_snap_cantx_us) + " us</h4>";
     }
 
-    wl_status_t status = WiFi.status();
-    // Display ssid of network connected to and, if connected to the WiFi, its own IP
-    content += "<h4>SSID: " + html_escape(ssid.c_str());
-    if (status == WL_CONNECTED) {
-      // Get and display the signal strength (RSSI) and channel
-      content += " RSSI:" + String(WiFi.RSSI()) + " dBm Ch: " + String(WiFi.channel());
+    // SSID/RSSI/channel are WiFi-specific; only show them when configured
+    if (!ssid.empty()) {
+      content += "<h4>SSID: " + html_escape(ssid.c_str());
+      if (wifi_connected()) {
+        // Get and display the signal strength (RSSI) and channel
+        content += " RSSI:" + String(WiFi.RSSI()) + " dBm Ch: " + String(WiFi.channel());
+      }
+      content += "</h4>";
     }
-    content += "</h4>";
-    if (status == WL_CONNECTED) {
-      content += "<h4>Hostname: " + html_escape(WiFi.getHostname()) + "</h4>";
-      content += "<h4>IP: " + WiFi.localIP().toString() + "</h4>";
+    // Reachability/hostname/IP reflect the active interface
+    if (network_connected()) {
+      content += "<h4>Hostname: " + html_escape(active_hostname()) + "</h4>";
+      // MAC is the station address, which is also the source address of the ESPNow
+      // frames - handy when filling in the ESPNow receiver MAC list on another node.
+      String mac = WiFi.macAddress();
+      mac.toLowerCase();
+      content += "<h4>IP (WiFi): " + WiFi.localIP().toString() + " MAC: " + mac + "</h4>";
     } else {
-      content += "<h4>Wifi state: " + getConnectResultString(status) + "</h4>";
+      // Reached only when no interface is up; keep this interface-agnostic
+      content += "<h4>Network state: Disconnected</h4>";
     }
 
     if (ap_active) {
@@ -1705,7 +1691,11 @@ String processor(const String& var) {
     // In-UI update notification (browser-side; skips dev builds, 6h cached) - issue #1660
     content += "<script>";
     content += "(function(){var cur='" + String(version_number) + "';";
-    content += "if(cur.indexOf('dev')>=0)return;";
+#ifdef GIT_TAG
+    content += "if(false)return;";
+#else
+    content += "if(true)return;";
+#endif
     content += "var el=document.getElementById('bxUpd');if(!el)return;";
     content += "function p(v){return v.replace(/^v/,'').split('.').map(function(x){return parseInt(x,10)||0;});}";
     content +=
@@ -1747,9 +1737,12 @@ void onOTAStart() {
 
 void onOTAProgress(size_t current, size_t final) {
   // Log every 1 second
-  if (millis() - ota_progress_millis > 1000) {
-    ota_progress_millis = millis();
-    logging.printf("OTA Progress Current: %u bytes, Final: %u bytes\n", current, final);
+  if (ota_progress_timer.elapsed()) {
+    if (final > 0) {
+      constexpr float BYTES_PER_KB = 1024.0f;
+      float percent = (float)current * 100.0f / (float) final;
+      logging.printf("OTA progress: %.1f%% (%.1f / %.1f KB)\n", percent, current / BYTES_PER_KB, final / BYTES_PER_KB);
+    }
     // Reset the "watchdog"
     ota_timeout_timer.reset();
   }
@@ -1762,11 +1755,13 @@ void onOTAEnd(bool success) {
 
   // Log when OTA has finished
   if (success) {
+    LOG_SET_NEXT_SEVERITY(5);  // notice
     logging.println("OTA update finished successfully!");
     hold_pins_across_reset();
     graceful_restart();
   } else {
-    logging.println("There was an error during OTA update!");
+    LOG_SET_NEXT_SEVERITY(3);  // err
+    logging.println("OTA update failed.");
     // Unpause battery (preserving equipment stop if set)
     setBatteryPause(false, false, EquipmentStop::UNCHANGED, false);
   }

@@ -59,9 +59,14 @@ enum class BatteryType {
   EnnoidBMS = 52,
   StellantisSmallWide4x4 = 53,
   ChargebyteCCSBattery = 54,
-  Akasol = 55,
+  VAGMqbEvo = 55,
+  Akasol = 56,
   Highest
 };
+
+
+
+
 
 extern std::vector<BatteryType> supported_battery_types();
 extern const char* name_for_battery_type(BatteryType type);

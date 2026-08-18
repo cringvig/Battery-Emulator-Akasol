@@ -28,23 +28,26 @@
 #include "src/devboard/utils/timer.h"
 #include "src/devboard/utils/types.h"
 #include "src/devboard/utils/value_mapping.h"
+#include "src/devboard/utils/version.h"
 #include "src/devboard/utils/watchdog.h"
 #include "src/devboard/webserver/webserver.h"
 #include "src/devboard/wifi/wifi.h"
 #include "src/inverter/INVERTERS.h"
 
 #if !defined(HW_LILYGO) && !defined(HW_LILYGO2CAN) && !defined(HW_STARK) && !defined(HW_3LB) && !defined(HW_BECOM) && \
-    !defined(HW_WAVESHARE) && !defined(HW_DEVKIT)
+    !defined(HW_WAVESHARE) && !defined(HW_DEVKIT) && !defined(HW_DFROBOT_EDGE101)
 #error You must select a target hardware!
 #endif
 
 // The current software version, shown on webserver
-const char* version_number = "12.2.dev";
+const char* version_number = BUILD_VERSION;
 
-// Interval timers
-volatile unsigned long currentMillis = 0;
-unsigned long previousMillis10ms = 0;
-unsigned long previousMillisUpdateVal = 0;
+// Interval timers. Time values are uint32_t on purpose: that is the width
+// millis() actually has on the target, so the wrap arithmetic is identical on
+// every platform (including the 64-bit host test build).
+volatile uint32_t currentMillis = 0;
+uint32_t previousMillis10ms = 0;
+uint32_t previousMillisUpdateVal = 0;
 // Task time measurement for debugging
 MyTimer core_task_timer_10s(INTERVAL_10_S);
 uint64_t start_time_10ms = 0;
@@ -114,7 +117,7 @@ void connectivity_loop(void*) {
       update_espnow();
     }
 
-    ota_monitor();
+    webserver_tick();
 
     END_TIME_MEASUREMENT_MAX(wifi, datalayer.system.status.wifi_task_10s_max_us);
 
@@ -311,7 +314,7 @@ static void filter_inverter_limits(void) {
   }
 }
 
-void update_calculated_values(unsigned long currentMillis) {
+void update_calculated_values(uint32_t currentMillis) {
   /* Update CPU temperature*/
   union {
     float temp;
@@ -325,17 +328,8 @@ void update_calculated_values(unsigned long currentMillis) {
   /*Update free heap*/
   datalayer.system.info.CPU_free_heap = ESP.getFreeHeap();
 
-  /* Check is remote set limits have timed out. Wrap-safe subtraction: the naive
-     "currentMillis > timestamp + timeout" comparison both overflows near the 49.7-day
-     millis() wrap (fresh limits expire immediately) and inverts after it (stale limits
-     persist up to another 49.7 days) */
-  if ((currentMillis - datalayer.battery.settings.remote_set_timestamp) >
-      datalayer.battery.settings.remote_set_timeout) {
-    datalayer.battery.settings.remote_settings_limit_charge = false;
-    datalayer.battery.settings.remote_settings_limit_discharge = false;
-    datalayer.battery.settings.max_remote_set_charge_dA = 0;
-    datalayer.battery.settings.max_remote_set_discharge_dA = 0;
-  }
+  /* Check if remote set limits have timed out */
+  update_remote_limit_expiry(currentMillis);
 
   /* Cap max charge/discharge to the lowest battery's limits */
   if (battery2) {
@@ -631,36 +625,22 @@ void core_loop(void*) {
         set_event(EVENT_TASK_OVERRUN, (currentMillis - previousMillis10ms));
       }
       previousMillis10ms = currentMillis;
-      if (datalayer.system.info.performance_measurement_active) {
-        START_TIME_MEASUREMENT(10ms);
-        monitor_equipment_stop_button();
-        led_exe();
-        handle_contactors();  // Take care of startup precharge/contactor closing
-        if (precharge_control_enabled) {
-          handle_precharge_control(currentMillis);  //Drive the hia4v1 via PWM
-        }
-        if (battery) {
-          battery->handle_precharge();
-        }
-        END_TIME_MEASUREMENT_MAX(10ms, datalayer.system.status.time_10ms_us);
-      } else {  //Run 10ms tasks without timing it
-        monitor_equipment_stop_button();
-        led_exe();
-        handle_contactors();  // Take care of startup precharge/contactor closing
-        if (precharge_control_enabled) {
-          handle_precharge_control(currentMillis);  //Drive the hia4v1 via PWM
-        }
-        if (battery) {
-          battery->handle_precharge();
-        }
+      START_TIME_MEASUREMENT(10ms);
+      monitor_equipment_stop_button();
+      led_exe();
+      handle_contactors();  // Take care of startup precharge/contactor closing
+      if (precharge_control_enabled) {
+        handle_precharge_control(currentMillis);  //Drive the hia4v1 via PWM
       }
+      if (battery) {
+        battery->handle_precharge();
+      }
+      END_TIME_MEASUREMENT_MAX(10ms, datalayer.system.status.time_10ms_us);
     }
 
     if (currentMillis - previousMillisUpdateVal >= INTERVAL_1_S && loopPhase == 1) {
       previousMillisUpdateVal = currentMillis;  // Order matters on the update_loop!
-      if (datalayer.system.info.performance_measurement_active) {
-        START_TIME_MEASUREMENT(values);
-      }
+      START_TIME_MEASUREMENT(values);
       update_pause_state();  // Check if we are OK to send CAN or need to pause
 
       // Fetch battery values
@@ -688,26 +668,18 @@ void core_loop(void*) {
 
       update_restart_progress();  // Check if we need to restart the ESP32
 
-      if (datalayer.system.info.performance_measurement_active) {
-        END_TIME_MEASUREMENT_MAX(values, datalayer.system.status.time_values_us);
-      }
+      END_TIME_MEASUREMENT_MAX(values, datalayer.system.status.time_values_us);
     }
-    if (datalayer.system.info.performance_measurement_active) {
-      START_TIME_MEASUREMENT(cantx);
+    START_TIME_MEASUREMENT(cantx);
 
-      for (auto& transmitter : transmitters) {
-        transmitter->transmit(currentMillis);
-      }
-
-      END_TIME_MEASUREMENT_MAX(cantx, datalayer.system.status.time_cantx_us);
-    } else {
-      for (auto& transmitter : transmitters) {
-        transmitter->transmit(currentMillis);
-      }
+    for (auto& transmitter : transmitters) {
+      transmitter->transmit(currentMillis);
     }
 
+    END_TIME_MEASUREMENT_MAX(cantx, datalayer.system.status.time_cantx_us);
+
+    END_TIME_MEASUREMENT_MAX(all, datalayer.system.status.core_task_10s_max_us);
     if (datalayer.system.info.performance_measurement_active) {
-      END_TIME_MEASUREMENT_MAX(all, datalayer.system.status.core_task_10s_max_us);
       if (datalayer.system.status.core_task_10s_max_us > datalayer.system.status.core_task_max_us) {
         // Update worst case total time
         datalayer.system.status.core_task_max_us = datalayer.system.status.core_task_10s_max_us;
@@ -759,10 +731,9 @@ void setup() {
 
   init_stored_settings();
 
-  if (wifi_enabled) {
-    xTaskCreatePinnedToCore((TaskFunction_t)&connectivity_loop, "connectivity_loop", 4096, NULL, TASK_CONNECTIVITY_PRIO,
-                            &connectivity_loop_task, esp32hal->WIFICORE());
-  }
+  // AP-button recovery must always run
+  xTaskCreatePinnedToCore((TaskFunction_t)&connectivity_loop, "connectivity_loop", 4096, NULL, TASK_CONNECTIVITY_PRIO,
+                          &connectivity_loop_task, esp32hal->WIFICORE());
 
   led_init();
 
