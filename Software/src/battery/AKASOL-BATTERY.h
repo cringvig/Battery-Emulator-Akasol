@@ -67,7 +67,7 @@ class AkasolBattery : public CanBattery, public BatteryHtmlRenderer {
   String get_status_html();
   bool renders_own_battery_data() { return true; }
 
-  static constexpr const char* Name = "AKASOL AKASYSTEM 15 OEM 50 PRC";
+  static constexpr const char* Name = "AKASOL";
 
  private:
   // --- CAN node addresses (J1939-style: the low byte of every extended ID) -

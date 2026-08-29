@@ -16,8 +16,56 @@
 #define AKASOL_NOMINAL_CAPACITY_AH 50
 #define AKASOL_NOMINAL_ENERGY_WH 33000
 #define AKASOL_NUMBER_OF_CELLS 180  // 15 modules * 12 cells, all in series
+// Battery's true physical design voltage limits (AKASOL User Manual,
+// doc 3-024001TEN_0001 v1.2: nominal 655V, range 540-756V). Used both for
+// SolaX frame 0x1872 (max_design_voltage_dV/min_design_voltage_dV) and by
+// Battery-Emulator's own generic safety.cpp over-/under-voltage cutoffs, so
+// this must describe the real battery, not any one inverter's expectations.
+//
+// TESTED AND RULED OUT (attempt 1): temporarily setting these to 7592/5824
+// (759.2V/582.4V, matching SolaX type 131 "TR25_P" / module count 13's own
+// documented table window exactly, per Dala's suggestion that these should
+// be "in tandem" with the SolaX battery type/module setting) made no
+// difference to the persistent IE07 BatVoltFault.
+//
+// TESTED AND RULED OUT (attempt 2, per Dala): narrowed to 700.0V/600.0V,
+// centered on the pack's actual operating point (~634-636V), on the theory
+// that the full 540-756V true design range might be an unlucky span that
+// doesn't sit well against any of SolaX's internal factory-battery voltage
+// windows. Also made no difference to IE07.
+//
+// Reverted to the battery's true limits below - two independent attempts at
+// tuning this value have shown no effect on the fault, and narrowing it only
+// risks a false over-/under-voltage event from Battery-Emulator's own
+// generic safety.cpp layer with no offsetting benefit.
 #define AKASOL_MAX_PACK_VOLTAGE_DV 7560  // 756.0V
 #define AKASOL_MIN_PACK_VOLTAGE_DV 5400  // 540.0V
+
+// Per-cell design voltage limits, derived directly from the pack limits above
+// divided by the real cell count (7560/180 = 42.0, 5400/180 = 30.0 - exact,
+// not a guess). FOUND MISSING (2026-08-27): datalayer.battery.info.max/min_
+// cell_voltage_mV were never set anywhere in this driver. The stock/pristine
+// SOLAX-CAN.cpp uses exactly these two fields as the denominator of its cell
+// voltage rescale math for frame 0x1874 (max_cell_voltage_mV - min_cell_
+// voltage_mV). Left at 0 (their default), that denominator is 0 - undefined
+// behaviour / division by zero in the ORIGINAL driver, before any of our own
+// patches. Every other supported battery driver sets these two fields; ours
+// never did. This is a very plausible reason AKASOL behaves differently from
+// the 50+ batteries the SolaX integration already works for, independent of
+// anything in SOLAX-CAN.cpp itself.
+#define AKASOL_MAX_CELL_VOLTAGE_MV 4200  // 4.2V, from 7560dV / 180 cells
+#define AKASOL_MIN_CELL_VOLTAGE_MV 3000  // 3.0V, from 5400dV / 180 cells
+
+// FOUND MISSING (2026-08-27, second pass): checked all ~49 other battery drivers in this
+// codebase for which datalayer.battery.info/status fields they set that we don't. 17/49
+// (mostly other NMC/NCA packs - BMW, Ford, Foxess, Geely, BYD, Jaguar etc.) set
+// info.max_cell_voltage_deviation_mV, which we never did either. It's used by safety.cpp's
+// own EVENT_CELL_DEVIATION_HIGH ("Large cell voltage deviation! Check balancing of cells") -
+// WARNING level only, does not affect system_status/FAULT or anything sent to Solax, but left
+// at 0 it means ANY nonzero real cell delta permanently trips that warning on the Events page.
+// 250mV matches the most common value used by other NMC/NCA drivers (BMW, Ford, Foxess,
+// Jaguar, Geely) - comfortably above AKASOL's own observed real-world delta (~47-48mV).
+#define AKASOL_MAX_CELL_DEVIATION_MV 250
 
 // Time (ms) to hold KL30_safe alone before asserting KL30.
 // Manual does not give an exact value; this is a conservative placeholder.
@@ -62,6 +110,9 @@ void AkasolBattery::setup() {
   datalayer.battery.info.total_capacity_Wh = AKASOL_NOMINAL_ENERGY_WH;
   datalayer.battery.info.max_design_voltage_dV = AKASOL_MAX_PACK_VOLTAGE_DV;
   datalayer.battery.info.min_design_voltage_dV = AKASOL_MIN_PACK_VOLTAGE_DV;
+  datalayer.battery.info.max_cell_voltage_mV = AKASOL_MAX_CELL_VOLTAGE_MV;
+  datalayer.battery.info.min_cell_voltage_mV = AKASOL_MIN_CELL_VOLTAGE_MV;
+  datalayer.battery.info.max_cell_voltage_deviation_mV = AKASOL_MAX_CELL_DEVIATION_MV;
 
   // Do not allow contactor closing / current flow until the state machine
   // below has taken the battery through Init -> Standby -> Operational.
@@ -402,112 +453,86 @@ void AkasolBattery::transmit_can(unsigned long currentMillis) {
   AKASOL_VCU_frame.data.u8[6] = 0xAA;               // val_code low byte  -> 0x55AA
   AKASOL_VCU_frame.data.u8[7] = 0x55;               // val_code high byte
 
-  // >>> TEMPORARY DIAGNOSTIC: rule out our own VCU1_to_BMM01 CAN message as
-  // the trigger for the persistent SCUError/detectDevice=163 fault. With this
-  // set to 1, we still receive and parse everything normally (status page
-  // keeps working), and the KL30/KL30_safe/Wake discrete signals still get
-  // driven exactly as before (that's hardware, not a CAN command) - we simply
-  // stop putting our own frame on the bus at all. If SCUError/detectDevice
-  // still shows up identically with zero bytes ever sent by us, that proves
-  // the fault is not a reaction to anything we transmit (bad alive counter,
-  // val_code, isolated_bmu bit, address, etc.) and is coming from inside the
-  // battery independent of the vehicle CAN side entirely.
-  // Diagnostic test complete (canlog_0d00h03m32s.txt: SCUError/detectDevice
-  // identical with zero bytes ever transmitted by us - ruled out our own CAN
-  // content as the trigger). Re-enabled now that AKASOL_BMU_ADDR is back to
-  // 0xF3/Tray01 (see AKASOL-BATTERY.h) for a full retest with the bridge
-  // refitted.
-#define AKASOL_DISABLE_CAN_TX 0
-#if !AKASOL_DISABLE_CAN_TX
   transmit_can_frame(&AKASOL_VCU_frame);
-#endif
 
   vcu_alive_counter++;
 }
 
-// Names and plain-English meaning of all 64 bits shared by BMM01_ErrorFlag,
-// BMM01_AlarmFlag and BMM01_WarningFlag (same bit layout in all three
-// messages, just ef_/af_/wf_ prefixes in the DBC). Descriptions are my best
-// reading of the AKASOL signal names - the exact internal logic behind each
-// is not publicly documented, but the names themselves are official.
-struct AkasolFaultBit {
-  const char* name;
-  const char* description;
-};
-
-// Descriptions below are AKASOL's own official comments, taken verbatim from
-// the PublicCAN.sym file (PCAN Symbol Editor format) supplied by AKASOL -
-// these are more precise than plain guesses from the signal names alone
-// (e.g. bit22/23 are specifically about the HVIL loop, not a generic current
-// sense loop; bit57 is explicitly tied to KL30/KL30Safe).
-static const AkasolFaultBit AKASOL_FAULT_BITS[64] = {
-    /*0*/ {"CellVoltageMax", "Maximum cell voltage above the specified limit"},
-    /*1*/ {"CellVoltageMin", "Minimum cell voltage below the specified limit"},
-    /*2*/ {"SysVoltageMax", "System voltage above the specified limit"},
-    /*3*/ {"SysVoltageMin", "System voltage below the specified limit"},
-    /*4*/ {"SysVoltageSum", "System voltage sum outside limit"},
-    /*5*/ {"ModVoltageSum", "Module voltage sum outside limit"},
-    /*6*/ {"ModVoltageRefMax", "Module reference voltage above specified limit"},
-    /*7*/ {"ModVoltageRefMin", "Module reference voltage below specified limit"},
-    /*8*/ {"IsoFaultBattNeg", "Isolation fault on negative battery terminal"},
-    /*9*/ {"IsoFaultBattPos", "Isolation fault on positive battery terminal"},
-    /*10*/ {"ContactorNegStuck", "Main contactor on negative battery terminal is stuck"},
-    /*11*/ {"ContactorPosStuck", "Main contactor on positive battery terminal is stuck"},
-    /*12*/ {"LVSupplyMax", "Supply voltage above the specified limit"},
-    /*13*/ {"LVSupplyMin", "Supply voltage below the specified limit"},
-    /*14*/ {"TerminalTempMax", "Maximum terminal temperature above the specified limit"},
-    /*15*/ {"TerminalTempMin", "Minimum terminal temperature below the specified limit"},
-    /*16*/ {"CellTempChargMax", "Maximum cell temperature when charging above the specified limit"},
-    /*17*/ {"CellTempChargMin", "Minimum cell temperature when charging below the specified limit"},
-    /*18*/ {"CellTempDischMax", "Maximum cell temperature when discharging above the specified limit"},
-    /*19*/ {"CellTempDischMin", "Minimum cell temperature when discharging below the specified limit"},
-    /*20*/ {"SysCurCha", "Charge current above the absolute current limit in charge direction"},
-    /*21*/ {"SysCurDis", "Discharge current above the absolute current limit in discharge direction"},
-    /*22*/ {"HVCurrLoopMax", "HVIL (HV interlock loop) short circuit"},
-    /*23*/ {"HVCurrLoopMin", "HVIL (HV interlock loop) open circuit"},
-    /*24*/ {"eStopCurrLoopMax", "eStop loop short circuit"},
-    /*25*/ {"eStopCurrLoopMin", "eStop loop open circuit"},
-    /*26*/ {"SysCurLimitCha", "Charge current above the actual current limit in charge direction"},
-    /*27*/ {"SysCurLimitDis", "Discharge current above the actual current limit in discharge direction"},
-    /*28*/ {"SysPrechargeFailed", "Precharge not successful"},
-    /*29*/ {"BMMBattCom", "Failure in battery communication (battery internal or between battery and VCU)"},
-    /*30*/ {"SysInitTimeout", "Failure in Init phase"},
-    /*31*/ {"SCUConfig", "Faulty configuration of battery system"},
-    /*32*/ {"DeepDischProt",
-            "Deep-discharge-protection against self-discharge of battery at low SOC - SCU disconnected from CAN"},
-    /*33*/ {"WDReset", "A watchdog reset has occurred"},
-    /*34*/ {"ExtCommunicationTout", "Timeout for public CAN messages"},
-    /*35*/ {"ContactorCoilCurrMax", "The contactor coil current is too high"},
-    /*36*/ {"CellVoltUnbalance", "Cell voltages are unbalanced"},
-    /*37*/ {"CellTempUnbalance", "Cell temperatures are unbalanced"},
-    /*38*/ {"TerminalTempUnbalance", "Terminal temperatures are unbalanced"},
-    /*39*/ {"FanError", "Fan is not working accordingly"},
-    /*40*/ {"KL15Max", "KL15 voltage is too high"},
-    /*41*/ {"KL30SafeCurrentMax", "Current through the safety channels is too high"},
-    /*42*/ {"StuckAtTemp", "At least one cell temperature measured value isn't updated any more"},
-    /*43*/ {"StuckAtVolt", "At least one cell voltage measured value isn't updated any more"},
-    /*44*/ {"TaskGuardianError", "Unexpected behaviour was detected by the task guardian"},
-    /*45*/ {"MemoryFault", "Error during memory operation"},
-    /*46*/ {"Rack_U_Unbalance",
-            "At least one battery rack/module voltage is unbalanced (parallel-connected system topology)"},
-    /*47*/ {"Module_Disconnected",
-            "At least one battery rack/module is electrically not connected (parallel-connected system topology)"},
-    /*48*/ {"InvalidData", "Invalid value detected"},
-    /*49*/ {"ContactorWrongState", "Contactor state doesn't match request"},
-    /*50*/ {"CurrSens", "Current sensor error occurred"},
-    /*51*/ {"ContDam", "Wear-out of contactors too high - no further operation allowed"},
-    /*52*/ {"RefVoltErrorMax", "SCU reference voltage above specified limit"},
-    /*53*/ {"RefVoltErrorMin", "SCU reference voltage below specified limit"},
-    /*54*/ {"Kl30SafeMax", "Supply voltage of KL30safe above the specified limit"},
-    /*55*/ {"Kl30SafeMin", "Supply voltage of KL30safe below the specified limit"},
-    /*56*/ {"SCUSupply", "SCU CPU supply under low limit"},
-    /*57*/ {"SCUPowerProtection", "Fault from KL30/KL30Safe power protection detected"},
-    /*58*/ {"Kl30SafeOff", "BMS-M-SafePower was switched off (HW detection)"},
-    /*59*/ {"Dew_Sensor", "Tray dew value out of range"},
-    /*60*/ {"ContactorDropOut", "A contactor drop-out occurred"},
-    /*61*/ {"ECUBoardTemp", "Board temperature exceeds a limit"},
-    /*62*/ {"Valve", "Valve error occurred"},
-    /*63*/ {"SCUError", "Indicates that the error was detected by the SCU"},
+// Signal names for all 64 bits shared by BMM01_ErrorFlag, BMM01_AlarmFlag and
+// BMM01_WarningFlag - the same bit layout in all three messages, only the
+// ef_/af_/wf_ prefix differs in the DBC. Names are AKASOL's own, taken from the
+// PublicCAN.sym file they supply.
+//
+// AKASOL's verbatim plain-English descriptions used to sit alongside each name and
+// were rendered in a "Meaning" column on the status page. They cost about 3 kB of
+// flash for something only ever read by a human looking at one web page, so they
+// are gone; the signal names are descriptive enough to search the AKASOL docs for.
+// Flash only - none of this was ever in RAM.
+static const char* const AKASOL_FAULT_BITS[64] = {
+    /*0*/ "CellVoltageMax",
+    /*1*/ "CellVoltageMin",
+    /*2*/ "SysVoltageMax",
+    /*3*/ "SysVoltageMin",
+    /*4*/ "SysVoltageSum",
+    /*5*/ "ModVoltageSum",
+    /*6*/ "ModVoltageRefMax",
+    /*7*/ "ModVoltageRefMin",
+    /*8*/ "IsoFaultBattNeg",
+    /*9*/ "IsoFaultBattPos",
+    /*10*/ "ContactorNegStuck",
+    /*11*/ "ContactorPosStuck",
+    /*12*/ "LVSupplyMax",
+    /*13*/ "LVSupplyMin",
+    /*14*/ "TerminalTempMax",
+    /*15*/ "TerminalTempMin",
+    /*16*/ "CellTempChargMax",
+    /*17*/ "CellTempChargMin",
+    /*18*/ "CellTempDischMax",
+    /*19*/ "CellTempDischMin",
+    /*20*/ "SysCurCha",
+    /*21*/ "SysCurDis",
+    /*22*/ "HVCurrLoopMax",
+    /*23*/ "HVCurrLoopMin",
+    /*24*/ "eStopCurrLoopMax",
+    /*25*/ "eStopCurrLoopMin",
+    /*26*/ "SysCurLimitCha",
+    /*27*/ "SysCurLimitDis",
+    /*28*/ "SysPrechargeFailed",
+    /*29*/ "BMMBattCom",
+    /*30*/ "SysInitTimeout",
+    /*31*/ "SCUConfig",
+    /*32*/ "reserved32",
+    /*33*/ "WDReset",
+    /*34*/ "ExtCommunicationTout",
+    /*35*/ "ContactorCoilCurrMax",
+    /*36*/ "CellVoltUnbalance",
+    /*37*/ "CellTempUnbalance",
+    /*38*/ "TerminalTempUnbalance",
+    /*39*/ "FanError",
+    /*40*/ "KL15Max",
+    /*41*/ "KL30SafeCurrentMax",
+    /*42*/ "StuckAtTemp",
+    /*43*/ "StuckAtVolt",
+    /*44*/ "TaskGuardianError",
+    /*45*/ "MemoryFault",
+    /*46*/ "reserved46",
+    /*47*/ "reserved47",
+    /*48*/ "InvalidData",
+    /*49*/ "ContactorWrongState",
+    /*50*/ "CurrSens",
+    /*51*/ "ContDam",
+    /*52*/ "RefVoltErrorMax",
+    /*53*/ "RefVoltErrorMin",
+    /*54*/ "Kl30SafeMax",
+    /*55*/ "Kl30SafeMin",
+    /*56*/ "SCUSupply",
+    /*57*/ "SCUPowerProtection",
+    /*58*/ "Kl30SafeOff",
+    /*59*/ "Dew_Sensor",
+    /*60*/ "ContactorDropOut",
+    /*61*/ "ECUBoardTemp",
+    /*62*/ "Valve",
+    /*63*/ "SCUError",
 };
 
 String AkasolBattery::get_status_html() {
@@ -519,7 +544,7 @@ String AkasolBattery::get_status_html() {
 
   content +=
       "<h4 style='margin-top:20px;color:#27b06c;border-bottom:2px solid #27b06c;padding-bottom:5px;'>"
-      "AKASOL internal state (from BMM01_State)</h4>";
+      "AKASOL internal state</h4>";
 
   auto flag_row = [&content](const char* label, bool value) {
     content += "<p style='margin:4px 0;'>";
@@ -544,7 +569,11 @@ String AkasolBattery::get_status_html() {
   flag_row("Precharge contactor closed", flag_contactor_precha);
   flag_row("HV interlock loop (HVIL) closed", flag_hvilstate);
   flag_row("E-stop / safety loop closed", flag_estoploopclosed);
-  flag_row("Internal KL30_safe seen by BMU", flag_internalkl30safe);
+  // Raw BMM01 bit 24. AKASOL's DBC gives the signal a name but never states its polarity,
+  // so a "no" here does not mean the BMU is missing KL30_safe - it means the bit reads 0,
+  // and we do not know which way round that is. The authoritative indicator is fault bit 58
+  // "Kl30SafeOff" in the table below: if that is clear, KL30_safe is fine.
+  flag_row("BMM01 bit24 (internal KL30_safe, polarity undocumented)", flag_internalkl30safe);
   flag_row("External shutdown requested", flag_extshutdownreq);
 
   content +=
@@ -576,13 +605,12 @@ String AkasolBattery::get_status_html() {
   // nothing gets missed even without AKASOL support available to ask.
   content +=
       "<h4 style='margin-top:20px;color:#27b06c;border-bottom:2px solid #27b06c;padding-bottom:5px;'>"
-      "Detailed fault bits (BMM01_ErrorFlag / AlarmFlag / WarningFlag)</h4>";
+      "Detailed fault bits</h4>";
   content +=
       "<table style='width:100%;border-collapse:collapse;font-size:0.85em;'>"
       "<tr style='color:#9be7c4;text-align:left;'>"
       "<th style='padding:3px 6px;'>#</th>"
       "<th style='padding:3px 6px;'>Signal</th>"
-      "<th style='padding:3px 6px;'>Meaning</th>"
       "<th style='padding:3px 6px;text-align:center;'>Err</th>"
       "<th style='padding:3px 6px;text-align:center;'>Alm</th>"
       "<th style='padding:3px 6px;text-align:center;'>Wrn</th>"
@@ -598,8 +626,7 @@ String AkasolBattery::get_status_html() {
     }
     content += "border-bottom:1px solid #333;'>";
     content += "<td style='padding:3px 6px;color:#888;'>" + String(i) + "</td>";
-    content += "<td style='padding:3px 6px;'><b>" + String(AKASOL_FAULT_BITS[i].name) + "</b></td>";
-    content += "<td style='padding:3px 6px;color:#ccc;'>" + String(AKASOL_FAULT_BITS[i].description) + "</td>";
+    content += "<td style='padding:3px 6px;'><b>" + String(AKASOL_FAULT_BITS[i]) + "</b></td>";
     content += "<td style='padding:3px 6px;text-align:center;'>" +
                String(e ? "<span style='color:#ff6b6b;font-weight:bold;'>ERROR</span>" : "-") + "</td>";
     content += "<td style='padding:3px 6px;text-align:center;'>" +
@@ -610,12 +637,13 @@ String AkasolBattery::get_status_html() {
   }
   content += "</table>";
 
-  content +=
-      "<p style='margin:10px 0 2px;color:#ccc;font-size:0.9em;'>BMM01_Error_info (internal AKASOL codes, "
-      "not publicly documented - quote these verbatim if contacting AKASOL support): value=" +
-      String(errinfo_value) + ", errornumber=" + String(errinfo_errornumber) +
-      ", srcCompClass=" + String(errinfo_srccompclass) + ", srcSubcompClass=" + String(errinfo_srcsubcompclass) +
-      ", srcCompNr=" + String(errinfo_srccompnr) + ", detectDevice=" + String(errinfo_detectdevice) + "</p>";
+  // Raw BMM01_Error_info fields. All zero means no error is being reported.
+  content += "<p style='margin:10px 0 2px;color:#ccc;font-size:0.9em;'>Error info: value=" +
+             String(errinfo_value) + ", errornumber=" + String(errinfo_errornumber) +
+             ", srcCompClass=" + String(errinfo_srccompclass) +
+             ", srcSubcompClass=" + String(errinfo_srcsubcompclass) +
+             ", srcCompNr=" + String(errinfo_srccompnr) + ", detectDevice=" +
+             String(errinfo_detectdevice) + "</p>";
 
   return content;
 }
